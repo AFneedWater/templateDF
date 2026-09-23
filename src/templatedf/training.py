@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 
 from .checkpoint import atomic_save, capture_rng, load_checkpoint, restore_rng, seed_all
 from .data import AA_ORDER, PAD_LABEL
@@ -67,13 +68,18 @@ def collate_training_samples(items):
     if not (lengths>0).all():
         raise ValueError("Empty peptide sample")
     maximum=int(lengths.max())
-    embeddings=torch.zeros(len(items),maximum,dim,dtype=torch.float32)
+    dtype=items[0]["embeddings"].dtype
+    if dtype not in (torch.float16, torch.float32, torch.bfloat16):
+        raise ValueError("Expected floating cached embeddings")
+    embeddings=torch.zeros(len(items),maximum,dim,dtype=dtype)
     labels=torch.full((len(items),maximum),PAD_LABEL,dtype=torch.long)
     for index,item in enumerate(items):
         length=int(lengths[index])
-        if item['embeddings'].shape!=(length,dim) or item['labels'].dtype!=torch.long:
+        if item['embeddings'].shape!=(length,dim) or item['labels'].dtype not in (torch.long,torch.int8):
             raise ValueError("Invalid cached tensor shapes or labels")
-        embeddings[index,:length]=item['embeddings'].detach().cpu().float()
+        if item['embeddings'].dtype != dtype:
+            raise ValueError('Mixed embedding dtypes in one batch')
+        embeddings[index,:length]=item['embeddings'].detach().cpu()
         labels[index,:length]=item['labels'].cpu()
     return {'embeddings':embeddings,'labels':labels,'lengths':lengths,
             'input_mask':torch.arange(maximum)[None,:]<lengths[:,None]}
@@ -98,7 +104,17 @@ class StatefulBatchSampler:
         end=min(self.cursor+self.batch_size,self.size)
         result=self.order[self.cursor:end].tolist()
         self.cursor=end
+        self.last_indices=result
         return result
+
+    def __iter__(self):
+        # One iterator is one (possibly resumed partial) epoch; no worker prefetch.
+        if self.cursor == self.size:
+            self.order=torch.randperm(self.size,generator=self.generator)
+            self.cursor=0
+            self.epoch+=1
+        while self.cursor < self.size:
+            yield self.next_indices()
 
     def state_dict(self):
         return {'size':self.size,'batch_size':self.batch_size,'order':self.order.clone(),
@@ -115,6 +131,35 @@ class StatefulBatchSampler:
         self.cursor=state['cursor']
         self.epoch=state['epoch']
         self.generator.set_state(state['generator'].cpu())
+
+
+def make_data_loader(dataset, *, device, batch_size=8, batch_sampler=None, seed=42, options=None):
+    settings={'num_workers':0,'persistent_workers':False,'pin_memory':True}
+    settings.update(options or {})
+    if set(settings)!={'num_workers','persistent_workers','pin_memory'}:
+        raise ValueError('Unsupported loader option; do not set prefetch_factor with num_workers=0')
+    if settings['num_workers'] != 0 or settings['persistent_workers'] is not False:
+        raise ValueError('RAM cache loader supports num_workers=0, persistent_workers=False')
+    cuda=torch.device(device).type=='cuda'
+    if not isinstance(settings['pin_memory'],bool) or (cuda and not settings['pin_memory']):
+        raise ValueError('CUDA RAM-cache batches require pin_memory=True')
+    kwargs=dict(num_workers=0,persistent_workers=False,pin_memory=cuda and settings['pin_memory'],
+                collate_fn=collate_training_samples,generator=torch.Generator().manual_seed(seed))
+    # Do not pass prefetch_factor at all. Private generator avoids changing model RNG.
+    if batch_sampler is not None:
+        kwargs['batch_sampler']=batch_sampler
+    else:
+        kwargs.update(batch_size=batch_size,shuffle=False)
+    return DataLoader(dataset,**kwargs)
+
+
+def batch_to_device(batch, device):
+    device=torch.device(device)
+    moved={key:value.to(device,non_blocking=device.type=='cuda') for key,value in batch.items()}
+    # Cache and host batch stay FP16. Upcast only this batch after GPU transfer,
+    # matching the existing FP32 input + BF16 autocast model/loss strategy.
+    moved['embeddings']=moved['embeddings'].float()
+    return moved
 
 
 class TrainingEngine:
@@ -168,12 +213,21 @@ class TrainingEngine:
             state=load_checkpoint(init_checkpoint)
             self._validate_identity(state)
             self.model.load_state_dict(state['model'],strict=True)
+        loader_options=config.get('dataloader',{})
+        self.train_loader=make_data_loader(train_dataset,device=self.device,batch_sampler=self.sampler,
+                                           seed=self.settings.seed,options=loader_options)
+        self.validation_loader=make_data_loader(validation_dataset,device=self.device,batch_size=self.settings.batch_size,
+                                                seed=self.settings.seed+1,options=loader_options)
+        self._train_iterator=None
 
     def _autocast(self):
         return torch.autocast('cuda',dtype=torch.bfloat16) if self.settings.precision=='bf16' else nullcontext()
 
     def _batch(self,dataset,indices):
-        return {key:value.to(self.device) for key,value in collate_training_samples([dataset[i] for i in indices]).items()}
+        batch=collate_training_samples([dataset[i] for i in indices])
+        if self.device.type=='cuda':
+            batch={key:value.pin_memory() for key,value in batch.items()}
+        return batch_to_device(batch,self.device)
 
     def _forward_loss(self,batch):
         # Labels are passed only to the loss, never to the autoencoder.
@@ -193,8 +247,15 @@ class TrainingEngine:
         if self.step>=self.settings.max_steps:
             raise RuntimeError("max_steps budget exhausted")
         self.model.train()
-        indices=self.sampler.next_indices()
-        batch=self._batch(self.train_dataset,indices)
+        if self._train_iterator is None:
+            self._train_iterator=iter(self.train_loader)
+        try:
+            host_batch=next(self._train_iterator)
+        except StopIteration:
+            self._train_iterator=iter(self.train_loader)
+            host_batch=next(self._train_iterator)
+        indices=list(self.sampler.last_indices)
+        batch=batch_to_device(host_batch,self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             metrics=self._forward_loss(batch)
@@ -217,10 +278,9 @@ class TrainingEngine:
         self.model.eval()
         accumulator=MetricAccumulator()
         try:
-            for start in range(0,len(self.validation_dataset),self.settings.batch_size):
-                indices=range(start,min(start+self.settings.batch_size,len(self.validation_dataset)))
+            for host_batch in self.validation_loader:
                 with self._autocast():
-                    metrics=self._forward_loss(self._batch(self.validation_dataset,indices))
+                    metrics=self._forward_loss(batch_to_device(host_batch,self.device))
                 accumulator.update(metrics)
             return accumulator.compute(self.settings.lambda_emb)
         finally:
@@ -261,6 +321,7 @@ class TrainingEngine:
         self.precision_runtime=state['precision_runtime']
         restore_rng(state['rng'],self.device)
         self.is_resume=True
+        self._train_iterator=None
 
     def save(self,path):
         atomic_save({'format_version':1,'stage':'1A','config':deepcopy(self.config),
@@ -282,6 +343,7 @@ class TrainingEngine:
             with (run_dir/'metrics.jsonl').open('a') as stream:
                 stream.write(json.dumps(row,allow_nan=False)+'\n')
         log('configuration',{'settings':asdict(self.settings),'precision':self.precision_runtime,
+                             'dataloader':{'num_workers':0,'persistent_workers':False,'pin_memory':self.train_loader.pin_memory},
                              'resume':self.is_resume,'esm_alignment_supervised':self.settings.lambda_emb>0})
         initial=self.evaluate()
         log('validation',initial)

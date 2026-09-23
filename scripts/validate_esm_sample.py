@@ -9,7 +9,7 @@ import torch
 
 from templatedf.data import decode_labels, load_fasta
 from templatedf.esm_features import ESMFeatureExtractor, local_cache_spec
-from templatedf.feature_cache import FeatureCache, collate_features
+from templatedf.feature_cache import FeatureCache, collate_features, load_caches_to_ram
 
 
 def main():
@@ -28,7 +28,9 @@ def main():
     if not 1 <= len(records) <= 8:
         parser.error("Validation is bounded to 1..8 sample records")
     spec = local_cache_spec(args.checkpoint, args.regression_checkpoint)
-    cache = FeatureCache(args.cache_dir, spec)
+    caches={"sample": FeatureCache(args.cache_dir, spec)}
+    load_caches_to_ram(caches)
+    cache=caches["sample"]
     extractor = ESMFeatureExtractor.from_local(args.checkpoint, args.regression_checkpoint, device=args.device)
     batch = extractor.extract(records)
     samples = []
@@ -36,8 +38,8 @@ def main():
     for record, batched in zip(records, batch):
         single = extractor.extract([record])[0]
         torch.testing.assert_close(single, batched, rtol=1e-3, atol=1e-4)
-        item = cache.read(record, dtype=torch.float32)
-        torch.testing.assert_close(item["embeddings"], batched, rtol=1e-3, atol=1e-3)
+        item = cache.read(record, dtype=torch.float16)
+        torch.testing.assert_close(item["embeddings"].float(), batched, rtol=1e-3, atol=1e-3)
         roundtrip = decode_labels(item["labels"])
         assert roundtrip == record.sequence
         loaded.append(item)
@@ -48,9 +50,9 @@ def main():
             "storage_dtype": spec.storage_dtype, "read_dtype": str(item["embeddings"].dtype),
             "single_vs_batch_max_abs_error": (single - batched).abs().max().item(),
             "cache_vs_batch_max_abs_error": (item["embeddings"] - batched).abs().max().item(),
-            "cache_path": str(cache.path_for(record).resolve()),
+            "cache_path": str(cache.root/"manifest.json"),
         })
-    collated = collate_features(loaded, dtype=torch.float32)
+    collated = collate_features(loaded, dtype=torch.float16)
     assert not collated["embeddings"][~collated["input_mask"]].any()
     assert (collated["labels"][~collated["input_mask"]] == -100).all()
     report = {

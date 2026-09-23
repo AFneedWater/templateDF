@@ -1,6 +1,6 @@
 # templateDF
 
-独立的肽模板重建与生成项目。当前已完成阶段 00–06 的工程实现及预算内试训：
+独立的肽模板重建与生成项目。阶段00–06已交付工程实现及预算内试训（阶段06待审）；当前缓存/RAM优化单独待人工验收：
 **FASTA/ESM 缓存、级联自编码器、有硬停止预算的 1A 训练与恢复，以及模板重建、温度采样和原始 latent 导出**。
 正式 4＋4 层模型已在 cuda:0 完成 300 步真实肽短训，验证残基准确率 10.38%，改善有限，尚未收敛。模板候选来自温度采样，不是 diffusion；改变输出长度不代表已验证信息保留。
 
@@ -56,7 +56,7 @@ python -m templatedf.esm_features \
   --fasta AgsgeGpr3I_10-150aa_train_140000.fasta \
   --cache-dir artifacts/train_cache \
   --checkpoint /home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt \
-  --device cuda:1 --batch-size 3 --limit 3 \
+  --device cuda:0 --batch-size 3 --limit 3 \
   --storage-dtype float16 --report reports/extract_sample.json
 ```
 
@@ -68,44 +68,48 @@ CLI 必须指定 `--limit N` 或显式 `--all`；阶段 01 未执行全量抽取
 
 ESM 始终冻结且 eval，FP32/no_grad 抽取第 33 层，每条按 `1:1+L` 取真实残基。
 每条特征为 `[L,1280]`；FP16 默认仅用于缓存存储，不等同于 BF16 autocast 训练。
-存在的缓存先验证再复用，损坏、来源不匹配会报错，不自动覆盖。
+新缓存目录必须不存在；写完全部分片后发布manifest。旧逐条PT缓存只保留历史产物，不继续作为加载后端。
 
-## 缓存契约和读取
+## NPY分片缓存与全量RAM读取
 
-每条记录存为一个 `.pt` 文件，文件名为 ID＋序列 SHA256 的稳定哈希。
-同 ID 不同序列不会覆盖；相同 ID 和序列可以复用同一缓存，数据记录仍保留。
-文件采用 `format_version=1`，外层为 `payload` 和 `sha256`；payload 包含：
+当前唯一缓存格式为`format_version=2 / npy_shards`。每片嵌入目标256 MiB（`--shard-mib 256`），不压缩、不按肽建立文件：
 
-- `id`、`sequence`、`sequence_hash`、`cache_key`、`length`、`aa_order`。
-- `labels`：int64 `[L]`；`embeddings`：默认 float16 `[L,1280]`。
-- `spec`：模型名、层、维度、存储 dtype，以及本地模型/回归权重的 SHA256、fair-esm 版本和计算精度。
+- `embeddings.npy`：FP16 `[该片总真实残基数,1280]`。
+- `offsets.npy`：int64 `[样本数+1]`，从0开始，以该片残基数结束。
+- `labels.npy`：int8 `[该片总真实残基数]`，值0..19，与嵌入排列一致。
+- `metadata.jsonl`：ID、序列、序列hash、长度、稳定cache_key、全局索引。
+- 根`manifest.json`：版本、ESM型号／层／权重来源、AA顺序、dtype、片信息、数量和校验和。
 
-读取使用 `weights_only=True`、CPU map_location；校验元数据、原序列、标签、形状、dtype、
-有限值和内容校验和。写入采用临时文件后原子发布，不覆盖已有文件。
-读取 dtype 必须显式指定；缓存文件的 `spec.storage_dtype` 始终描述磁盘格式。
+不保存padding/BOS/EOS；训练batch中标签才转int64并用-100补齐。相同ID不同序列用ID＋序列hash区分，不覆盖。缓存只保存冻结ESM第33层输出，级联encoder每步仍参与前向和反向。
+
+训练入口先审计独立train/validation，再检查manifest及NPY头，**分配数组前**打印两个集合合计RAM估算。默认预算40 GiB，包含数组和元信息／索引保守预留；不包括模型、优化器、batch和OS。超预算直接报所需容量，无自动回退。相同缓存目录只加载一次。
+
+使用`np.load(..., mmap_mode=None, allow_pickle=False)`依次读入各片并保留普通数组；不全局concatenate，不整份转FP32，不锁页全部缓存。Dataset按索引返回RAM切片，加载时完成hash／offset／标签／有限值检查；取样期间不再打开缓存文件。仅写缓存时允许合并当前片。
 
 ```python
-from functools import partial
-import torch
-from torch.utils.data import DataLoader
 from templatedf.data import load_fasta
-from templatedf.esm_features import local_cache_spec
-from templatedf.feature_cache import FeatureCache, CachedPeptideDataset, collate_features
+from templatedf.feature_cache import FeatureCache, CachedPeptideDataset, load_caches_to_ram
+from templatedf.training import StatefulBatchSampler, make_data_loader, batch_to_device
 
-records, stats = load_fasta("artifacts/01_sample/real_train_sample.fasta")
-spec = local_cache_spec(
-    "/home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt",
-    "/home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D-contact-regression.pt",
-)
-cache = FeatureCache("artifacts/01_sample/cache", spec)
-dataset = CachedPeptideDataset(records, cache, dtype=torch.float32)
-loader = DataLoader(dataset, batch_size=3,
-                    collate_fn=partial(collate_features, dtype=torch.float32))
-batch = next(iter(loader))  # embeddings [B,Lmax,1280]，padding 嵌入为零
+# 两个目录须是已生成的NPY v2缓存；此处路径是示例。
+caches = {"train": FeatureCache("artifacts/train_npy"),
+          "validation": FeatureCache("artifacts/validation_npy")}
+loading = load_caches_to_ram(caches, budget_gib=40)
+records, _ = load_fasta("artifacts/05_pilot/train.fasta")
+dataset = CachedPeptideDataset(records, caches["train"])  # FP16视图，不读盘
+sampler = StatefulBatchSampler(len(dataset), batch_size=8, seed=42)
+loader = make_data_loader(dataset, device="cuda:0", batch_sampler=sampler)
+# 每轮重新iter(loader)：打乱索引；collate仅为当前batch补零。
+for host_batch in loader:
+    batch = batch_to_device(host_batch, "cuda:0")
+    # 此时该batch在GPU上为FP32，进入现有BF16 autocast模型。
 ```
 
-读取不构造 ESM；`local_cache_spec` 仅读取文件计算哈希。若已有可信抽取报告，
-也可从其中的 `spec` 构造 `CacheSpec(**report["spec"])`。
+默认`num_workers=0`、`persistent_workers=False`，不传prefetch_factor；当前实现不开放多worker。CUDA时只锁页collate后的FP16 batch；CPU运行不锁页。传入GPU后只将当前batch转FP32，保留既有BF16/autocast和FP32损失策略。Checkpoint保存的shuffle排列、游标和生成器继续用于恢复。
+
+以140000条、平均80aa计算，纯FP16嵌入约26.70 GiB；这是公式估算，不是本次实测。真实预算由manifest和数组头估算，在约90 GB RAM内仍应人工核对进程峰值和系统余量。
+
+本次只执行 [RAM缓存smoke](reports/cache_ram_logs/smoke.log)，真实全量加载耗时、峰值RSS和训练OS级I/O均未实测；[修改与人工启动命令](reports/CACHE_RAM_OPTIMIZATION.md)。历史PT文件不自动转换或重新抽取，旧训练缓存不能直接交给新入口；阶段05 checkpoint仍可用于阶段06推理，或明确以`--init-checkpoint`只初始化模型权重。
 
 ## 级联编码器（阶段 02）
 
@@ -213,8 +217,8 @@ python -m templatedf.train --config configs/train.yaml \
   --device cuda:0 --precision bf16 --max-steps 100 --output-dir artifacts/run_1a
 ```
 
-`--cache-spec` 接受阶段 01 抽取报告中的 spec 或直接 CacheSpec JSON；不加载 ESM 权重。
-模型 D 必须匹配缓存的 1280 维；缓存读取显式转为 FP32，BF16 通过 CUDA autocast 实现。
+`--cache-spec` 是可选来源约束，通常直接读取两个缓存manifest；训练不加载ESM权重。
+模型D必须为缓存的1280维；缓存和host batch保持FP16，当前batch传GPU后才转FP32，BF16通过CUDA autocast实现。
 不支持原生 BF16 时直接报错，不静默回退。JSONL 日志记录实际输出 dtype 与 autocast 状态。
 
 训练每步固定 Lout=Lin，标签只进入损失，不进入模型。总损失为 CE＋lambda_emb×嵌入 MSE：
@@ -242,13 +246,13 @@ Checkpoint 包含配置、模型、AdamW 状态、实际 scheduler/scaler 状态
 ESM 来源与数据指纹、Python/NumPy/CPU Torch/当前 CUDA 设备 RNG，以及 shuffle 排列、游标和生成器状态。
 采用临时文件＋原子替换，读取使用 weights_only=True。
 resume 检查模型、来源、数据与训练设置；只允许改变累计预算及验证/保存间隔。
-当前采样和缓存读取为单进程，避免预取游标影响精确恢复。CPU 带 dropout/scheduler 的恢复对照已验证逐参数一致。
+当前缓存仅启动时读取，采样为单进程无预取，沿用shuffle游标恢复；历史CPU恢复对照属于更改前版本，本次按要求未重跑训练恢复。新checkpoint增加缓存manifest指纹，不直接将历史PT缓存训练状态跨格式resume。
 
-输出目录保存 metrics.jsonl、summary.json、last.pt，以及 CLI 的数据审核和缓存来源文件。
+输出目录保存 metrics.jsonl、summary.json、last.pt、cache_loading.json（容量估算和实际加载耗时），以及CLI的数据审核和缓存来源文件。
 新训练拒绝覆盖已有日志；resume 可接续原目录或写入新目录。max_steps 达到后保存并停止。
 日志以 data_kind 区分 real_cached 与 mock 来源的 synthetic，不能将合成结果视为真实肽效果。
 
-本次可复验合成检查：
+历史训练验收脚本（已适配新格式，但本次未执行）：
 
 ```bash
 OMP_NUM_THREADS=4 python scripts/validate_training.py \
@@ -281,7 +285,7 @@ OMP_NUM_THREADS=4 python scripts/validate_training.py \
 
 - [训练曲线](reports/05_logs/training_curves.png)、[分桶指标CSV](reports/05_logs/validation_by_length.csv)、[运行汇总](artifacts/05_pilot/ce_run/summary.json)。
 - `scripts/summarize_pilot.py` 从实测记录重新导出图表和组成基线。
-- `OMP_NUM_THREADS=4 python scripts/verify_pilot_checkpoint.py` 只读恢复并复算独立验证，检查300步硬预算，不追加优化。
+- 历史 `scripts/verify_pilot_checkpoint.py` 依赖阶段05当时的数据缓存；旧PT缓存与当前NPY读取器不兼容，本次未重跑。Checkpoint本身可继续用于阶段06独立模板推理。
 - `scripts/run_pilot.py` 保存本次 prepare／extract／benchmark／train 的复现入口；实际命令见阶段05报告。固定产物已存在，脚本拒绝重复抽样、基准及重启训练，以免覆盖证据或无意追加预算。
 
 ## 模板重建、候选生成与 latent 导出（阶段06）

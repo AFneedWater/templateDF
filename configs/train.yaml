@@ -8,8 +8,7 @@ data:
   check_sequences: true
   train_path: /home/gh/templateDF/AgsgeGpr3I_10-150aa_train_140000.fasta
   test_path: /home/gh/templateDF/AgsgeGpr3I_10-150aa_test_30000.fasta
-  validation_path: null  # 通用模板须指定；阶段05已确认的128条验证路径保存在独立实测配置中
-
+  validation_path: /home/gh/templateDF/AgsgeGpr3I_10-150aa_validation_30000.fasta
 esm:
   model_name: esm2_t33_650M_UR50D
   representation_layer: 33
@@ -19,12 +18,20 @@ esm:
   contact_regression_path: /home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D-contact-regression.pt
 
 cache:
-  format_version: 1
+  format_version: 2
+  format: npy_shards
+  shard_mib: 256
   storage_dtype: float16
-  read_dtype: float32
+  read_dtype: float16
+  ram_budget_gib: 40.0  # 训练与验证合计；含元信息估算，不包含模型/优化器/batch
   train_dir: null
   validation_dir: null
   spec_path: null
+
+dataloader:
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: true  # 只锁页CUDA当前batch；CPU运行自动关闭；不设置prefetch_factor
 
 model:
   dim: 1280

@@ -98,13 +98,13 @@ def extract():
     import torch
     from templatedf.data import load_fasta
     from templatedf.esm_features import ESMFeatureExtractor, local_cache_spec, DEFAULT_CHECKPOINT
-    from templatedf.feature_cache import FeatureCache
+    from templatedf.feature_cache import FeatureCacheWriter
     checkpoint = DEFAULT_CHECKPOINT
     regression = checkpoint.with_name(checkpoint.stem + '-contact-regression.pt')
     start = time.perf_counter()
     spec = local_cache_spec(checkpoint, regression)
     dump(ART/'cache_spec.json', asdict(spec))
-    cache = FeatureCache(ART/'cache', spec)
+    cache = FeatureCacheWriter(ART/'cache', spec)
     records = [r for name in ('train','validation') for r in load_fasta(ART/f'{name}.fasta')[0]]
     if len(records) > 640:
         raise ValueError('Stage 05 cache budget exceeded')
@@ -118,24 +118,17 @@ def extract():
     records.sort(key=lambda r:r.length)
     for start_index in range(0,len(records),8):
         group=records[start_index:start_index+8]
-        pending=[]
-        for record in group:
-            if cache.path_for(record).exists():
-                cache.read(record,dtype=torch.float32)
-                reused+=1
-            else:
-                pending.append(record)
+        pending=group
         if pending:
             features=extractor.extract(pending)
             for record,feature in zip(pending,features):
                 assert feature.shape == (record.length,1280) and feature.dtype == torch.float32
                 assert not feature.requires_grad
                 cache.write(record,feature)
-                sample=cache.read(record,dtype=torch.float32)
-                assert torch.equal(sample['embeddings'],feature.half().float())
                 checked.append({'id':record.id,'length':record.length,'shape':list(feature.shape),'compute_dtype':str(feature.dtype)})
         if (start_index//8)%10==0:
             print(f'ESM cache {min(start_index+8,len(records))}/{len(records)}',flush=True)
+    cache.close()
     torch.cuda.synchronize(0)
     end=time.perf_counter()
     assert not extractor.model.training and all(not p.requires_grad for p in extractor.model.parameters())
@@ -143,7 +136,7 @@ def extract():
             'records':len(records),'reused':reused,'new_entries':len(checked),'batch_size':8,
             'weights_hashing_and_model_load_seconds':loaded-start,'extraction_and_cache_io_seconds':end-loaded,
             'total_seconds':end-start,'frozen':True,'eval':True,'residue_slice':'row i, 1:1+L_i',
-            'cache_roundtrip_checked':True,'compute_dtype':'torch.float32','storage_dtype':spec.storage_dtype,
+            'cache_roundtrip_checked':False,'compute_dtype':'torch.float32','storage_dtype':spec.storage_dtype,
             'max_allocated_bytes':torch.cuda.max_memory_allocated(0),'max_reserved_bytes':torch.cuda.max_memory_reserved(0),
             'spec':asdict(spec),'checked_shapes':checked}
     dump(LOG/'cache_extraction.json',report)
@@ -163,13 +156,15 @@ def config_for(batch_size, steps):
 def datasets():
     import torch
     from templatedf.data import load_fasta,file_sha256
-    from templatedf.feature_cache import CacheSpec,FeatureCache,CachedPeptideDataset
+    from templatedf.feature_cache import CacheSpec,FeatureCache,CachedPeptideDataset,load_caches_to_ram
     spec=CacheSpec(**json.loads((ART/'cache_spec.json').read_text()))
-    cache=FeatureCache(ART/'cache',spec)
-    ds={name:CachedPeptideDataset(load_fasta(ART/f'{name}.fasta')[0],cache,dtype=torch.float32) for name in ('train','validation')}
+    caches={'shared':FeatureCache(ART/'cache',spec)}
+    load_caches_to_ram(caches)
+    cache=caches['shared']
+    ds={name:CachedPeptideDataset(load_fasta(ART/f'{name}.fasta')[0],cache,dtype=torch.float16) for name in ('train','validation')}
     assert len(ds['train'])<=512 and len(ds['validation'])<=128
     assert not ({r.sequence_hash for r in ds['train'].records}&{r.sequence_hash for r in ds['validation'].records})
-    provenance={'data_kind':'real_cached','esm_source':asdict(spec),**{name:{'file_sha256':file_sha256(ART/f'{name}.fasta'),'retained':len(ds[name])} for name in ds}}
+    provenance={'data_kind':'real_cached','esm_source':asdict(spec),**{name:{'file_sha256':file_sha256(ART/f'{name}.fasta'),'retained':len(ds[name]),'cache_manifest_sha256':cache.manifest_sha256} for name in ds}}
     return ds,provenance
 
 
@@ -230,7 +225,7 @@ def benchmark(batch_size):
     from templatedf.feature_cache import CachedPeptideDataset
     ds,provenance=datasets()
     longest=sorted(ds['train'].records,key=lambda r:r.length,reverse=True)[:batch_size]
-    ds['train']=CachedPeptideDataset(longest,ds['train'].cache,dtype=torch.float32)
+    ds['train']=CachedPeptideDataset(longest,ds['train'].cache,dtype=torch.float16)
     provenance['train'].update(benchmark_selected_ids=[r.id for r in longest],retained=batch_size)
     cfg=config_for(batch_size,40)
     path=LOG/f'benchmark_batch{batch_size}.json'

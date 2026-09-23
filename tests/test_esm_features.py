@@ -1,12 +1,9 @@
-from dataclasses import replace
-
 import pytest
 import torch
 from torch import nn
 
 from templatedf.data import PeptideRecord, encode_labels
 from templatedf.esm_features import ESMFeatureExtractor, local_cache_spec
-from templatedf.feature_cache import CacheError, CacheSpec, CachedPeptideDataset, FeatureCache, collate_features
 
 
 class PositionAlphabet:
@@ -70,72 +67,12 @@ def test_missing_local_weights_fail_before_any_hub_access(tmp_path, monkeypatch)
         local_cache_spec(tmp_path / "missing.pt", tmp_path / "regression.pt")
 
 
-@pytest.fixture
-def cache_record(tmp_path):
-    spec = CacheSpec(source="mock:position-v1")
-    cache = FeatureCache(tmp_path / "cache", spec)
-    record = PeptideRecord("same/id", "ACDEFGHIKL")
-    feature = torch.arange(10).float()[:, None].expand(-1, 1280)
-    cache.write(record, feature)
-    return cache, record
-
-
-@pytest.mark.parametrize("storage_dtype", ["float16", "bfloat16", "float32"])
-def test_cache_roundtrip_dtype_and_collation(tmp_path, storage_dtype):
-    cache = FeatureCache(tmp_path, CacheSpec(source="mock:position-v1", storage_dtype=storage_dtype))
-    records = [PeptideRecord("same/id", "ACDEFGHIKL"), PeptideRecord("same/id", "C" * 150)]
-    for record in records:
-        feature = torch.arange(record.length).float()[:, None].expand(-1, 1280)
-        cache.write(record, feature)
-        item = cache.read(record, dtype=torch.float32)
-        assert item["id"] == record.id and item["sequence_hash"] == record.sequence_hash
-        assert item["length"] == record.length
-        assert torch.equal(item["labels"], encode_labels(record.sequence))
-        assert torch.equal(item["embeddings"], feature)
-        assert item["embeddings"].dtype == torch.float32
-    assert cache.path_for(records[0]) != cache.path_for(records[1])
-    dataset = CachedPeptideDataset(records, cache, dtype=torch.float32)
-    batch = collate_features([dataset[0], dataset[1]], dtype=torch.float32)
-    assert batch["embeddings"].shape == (2, 150, 1280)
-    assert torch.count_nonzero(batch["embeddings"][0, 10:]) == 0
-    assert (batch["labels"][0, 10:] == -100).all()
-    assert batch["input_mask"].sum(1).tolist() == [10, 150]
-    with pytest.raises(FileExistsError):
-        cache.write(records[0], torch.zeros(10, 1280))
-    # Failed duplicate publication left original intact and no partial files.
-    assert cache.read(records[0], dtype=torch.float32)["embeddings"][9, 0] == 9
-    assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_wrong_source_and_storage_dtype_rejected(cache_record):
-    cache, record = cache_record
-    for spec in (replace(cache.spec, source="mock:different"), replace(cache.spec, storage_dtype="float32")):
-        with pytest.raises(CacheError, match="metadata/source mismatch"):
-            FeatureCache(cache.root, spec).read(record, dtype=torch.float32)
-
-
-@pytest.mark.parametrize("damage", ["id", "hash", "length", "labels", "shape", "dtype", "nan", "finite_value", "layer", "version", "truncated"])
-def test_corrupt_cache_rejected(cache_record, damage):
-    cache, record = cache_record
-    path = cache.path_for(record)
-    if damage == "truncated":
-        path.write_bytes(b"broken cache")
-    else:
-        envelope = torch.load(path, weights_only=True)
-        payload = envelope["payload"]
-        if damage == "id": payload["id"] = "other"
-        elif damage == "hash": payload["sequence_hash"] = "bad"
-        elif damage == "length": payload["length"] += 2
-        elif damage == "labels": payload["labels"][0] = 19
-        elif damage == "shape": payload["embeddings"] = payload["embeddings"][:-1]
-        elif damage == "dtype": payload["embeddings"] = payload["embeddings"].float()
-        elif damage == "nan": payload["embeddings"][0, 0] = float("nan")
-        elif damage == "finite_value": payload["embeddings"][0, 0] = 123
-        elif damage == "layer": payload["spec"]["layer"] = 32
-        elif damage == "version": payload["format_version"] = 99
-        torch.save(envelope, path)
-    with pytest.raises(CacheError, match="Invalid cache"):
-        cache.read(record, dtype=torch.float32)
+def test_npy_ram_cache_smoke(tmp_path):
+    import runpy
+    from pathlib import Path
+    run=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/smoke_ram_cache.py'))['run_smoke']
+    report=run(tmp_path,'cpu')
+    assert report['roundtrip_exact_after_fp16_cast'] and len(report['batches'])==2
 
 
 @pytest.mark.parametrize("budget", [[], ["--limit", "0"], ["--limit", "-1"],

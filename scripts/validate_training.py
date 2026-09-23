@@ -13,7 +13,7 @@ import torch
 import yaml
 
 from templatedf.data import AA_ORDER, PeptideRecord
-from templatedf.feature_cache import CacheSpec, FeatureCache
+from templatedf.feature_cache import CacheSpec, FeatureCacheWriter
 from templatedf.losses import reconstruction_loss
 from templatedf.training import TrainingEngine
 
@@ -124,13 +124,13 @@ def main():
                                          eval_every=1,save_every=1,learning_rate=0.0001,scheduler_gamma=0.99)
         cache_config['data']={'train_path':str(root/'train.fasta'),'validation_path':str(root/'validation.fasta')}
         cache_config['cache']={'train_dir':str(root/'train_cache'),'validation_dir':str(root/'validation_cache'),
-                               'spec_path':str(root/'cache_spec.json'),'read_dtype':'float32','storage_dtype':'float16'}
+                               'spec_path':str(root/'cache_spec.json'),'read_dtype':'float16','storage_dtype':'float16'}
         for split,lengths in (('train',[10,12]),('validation',[11,13])):
             records=[PeptideRecord(f'synthetic_{split}_{i}',AA_ORDER[i]*length) for i,length in enumerate(lengths)]
             (root/f'{split}.fasta').write_text(''.join(f'>{r.id}\n{r.sequence}\n' for r in records))
-            cache=FeatureCache(root/f'{split}_cache',spec)
-            for record,item in zip(records,make_samples(lengths,1280)):
-                cache.write(record,item['embeddings'])
+            with FeatureCacheWriter(root/f'{split}_cache',spec) as cache:
+                for record,item in zip(records,make_samples(lengths,1280)):
+                    cache.write(record,item['embeddings'])
         config_path=root/'cached_bf16_config.yaml'
         config_path.write_text(yaml.safe_dump(cache_config))
         gpu_dir=root/'cached_bf16'

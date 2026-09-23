@@ -10,7 +10,7 @@ import time
 import torch
 
 from .data import PeptideRecord, file_sha256, load_fasta, validate_sequence
-from .feature_cache import CacheSpec, FeatureCache, STORAGE_DTYPES
+from .feature_cache import CacheSpec, FeatureCacheWriter, STORAGE_DTYPES
 
 MODEL_NAME = "esm2_t33_650M_UR50D"
 DEFAULT_CHECKPOINT = Path("/home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt")
@@ -103,11 +103,12 @@ def main():
     budget.add_argument("--limit", type=int, help="Maximum retained records to process")
     budget.add_argument("--all", action="store_true", help="Explicitly request full extraction")
     parser.add_argument("--storage-dtype", choices=STORAGE_DTYPES, default="float16")
+    parser.add_argument("--shard-mib", type=int, default=256, help="Target unpadded embedding MiB per NPY shard")
     parser.add_argument("--no-sequence-check", action="store_true",
                         help="Skip FASTA prefiltering; extraction still rejects invalid sequences")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
-    if args.batch_size < 1 or (args.limit is not None and args.limit < 1):
+    if args.batch_size < 1 or args.shard_mib < 1 or (args.limit is not None and args.limit < 1):
         parser.error("batch-size and limit must be positive")
     start = time.monotonic()
     regression = args.regression_checkpoint or args.checkpoint.with_name(args.checkpoint.stem + "-contact-regression.pt")
@@ -116,35 +117,27 @@ def main():
     if not selected:
         parser.error("No retained records available for extraction")
     spec = local_cache_spec(args.checkpoint, regression, storage_dtype=args.storage_dtype)
-    cache = FeatureCache(args.cache_dir, spec)
-    pending = {}
-    reused = 0
-    for record in selected:
-        validate_sequence(record.sequence)
-        if cache.path_for(record).exists():
-            cache.read(record, dtype=torch.float32)  # Never silently reuse a bad/stale entry.
-            reused += 1
-        else:
-            pending.setdefault(record.cache_key, record)
-    extractor = None
-    if pending:
+    source = {"path": str(args.fasta.resolve()), "sha256": file_sha256(args.fasta)}
+    # An explicit new directory prevents accidental overwrite or mixed sources.
+    with FeatureCacheWriter(args.cache_dir, spec, target_shard_bytes=args.shard_mib*1024**2, source_fasta=source) as writer:
         extractor = ESMFeatureExtractor.from_local(args.checkpoint, regression, device=args.device)
-        missing = list(pending.values())
-        for offset in range(0, len(missing), args.batch_size):
-            chunk = missing[offset:offset + args.batch_size]
+        for offset in range(0, len(selected), args.batch_size):
+            chunk = selected[offset:offset + args.batch_size]
             for record, feature in zip(chunk, extractor.extract(chunk)):
-                cache.write(record, feature)
+                writer.write(record, feature)
+            if offset % (args.batch_size*100) == 0:
+                print(f"ESM records {min(offset+args.batch_size, len(selected))}/{len(selected)}", flush=True)
     report = {
         "fasta": str(args.fasta.resolve()), "fasta_sha256": file_sha256(args.fasta),
         "filter_stats": asdict(stats), "selected_records": len(selected),
         "selected_unique_cache_keys": len({r.cache_key for r in selected}),
-        "new_cache_entries": len(pending), "reused_records": reused,
+        "new_cache_entries": len(selected), "reused_records": 0,
+        "format_version": 2, "shards": len(writer.shards), "manifest": str((args.cache_dir/"manifest.json").resolve()),
         "model_loaded": extractor is not None, "device": args.device,
         "spec": asdict(spec), "cache_dir": str(args.cache_dir.resolve()),
         "checkpoint": str(args.checkpoint.resolve()), "regression_checkpoint": str(regression.resolve()),
         "elapsed_seconds": time.monotonic() - start,
-        "records": [{"id": r.id, "sequence_hash": r.sequence_hash, "length": r.length,
-                     "cache_path": str(cache.path_for(r).resolve())} for r in selected],
+
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
