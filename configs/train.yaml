@@ -1,0 +1,57 @@
+# 通用缓存1A训练模板。须明确设置预算、validation和缓存路径；阶段05实测配置见 artifacts/05_pilot/ce_config.yaml。
+data:
+  min_seq_len: 10
+  max_seq_len: 150
+  aa_order: ACDEFGHIKLMNPQRSTVWY
+  padding_label: -100
+  nonstandard_residues: skip_record
+  check_sequences: true
+  train_path: /home/gh/templateDF/AgsgeGpr3I_10-150aa_train_140000.fasta
+  test_path: /home/gh/templateDF/AgsgeGpr3I_10-150aa_test_30000.fasta
+  validation_path: null  # 通用模板须指定；阶段05已确认的128条验证路径保存在独立实测配置中
+
+esm:
+  model_name: esm2_t33_650M_UR50D
+  representation_layer: 33
+  frozen: true
+  eval_mode: true
+  checkpoint_path: /home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt
+  contact_regression_path: /home/gh/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D-contact-regression.pt
+
+cache:
+  format_version: 1
+  storage_dtype: float16
+  read_dtype: float32
+  train_dir: null
+  validation_dir: null
+  spec_path: null
+
+model:
+  dim: 1280
+  num_latents: 50  # latent token 数，不是最短肽长度
+  encoder_blocks: 4
+  decoder_blocks: 4
+  num_heads: 20
+  conv_kernel: 7
+  fusion_hidden_dim: 2560
+  encoder_ffn_ratio: 2
+  pool_ffn_ratio: 4
+  decoder_ffn_ratio: 4
+  dropout: 0.1
+  length_scale: 150
+  condition: null
+
+training:
+  stage: 1A
+  precision: bf16  # 原生 CUDA BF16 autocast；不支持时明确报错
+  batch_size: 8    # 阶段05已通过正式4＋4层BF16实测；未搜索最大batch
+  lambda_emb: 0.0
+  device: cuda
+  max_steps: null  # 必须由本次运行明确给定；resume 时表示累计步数上限
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  seed: 42
+  eval_every: 100
+  save_every: 100
+  scheduler_gamma: 1.0  # 1 表示不用 scheduler；小于 1 时使用逐步 ExponentialLR
